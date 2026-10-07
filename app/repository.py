@@ -28,6 +28,14 @@ class ConfigConflictError(Exception):
         self.current_revision = current_revision
 
 
+class BackfillError(Exception):
+    """历史补投前置条件不满足（如订阅已停用）。"""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 # -- 行 -> dict 映射 -----------------------------------------------------------
 
 DELIVERY_COLUMNS = """
@@ -642,6 +650,186 @@ async def get_event(
         """,
         event_pk,
     )
+
+
+# -- 历史事件补投（backfill） -----------------------------------------------------
+#
+# 背景：现有事件只在提交状态机终结（finalize_event_submission）的那一刻、按当时
+# 的“活跃订阅集合”建立初始投递（chain_seq=1）并固定配置版本。之后才注册的订阅
+# 永远拿不到它创建之前的旧事件投递——即使这些旧事件仍未投递。补投即按事件主键
+# 闭区间为单个订阅补齐这些“缺失的初始投递”。
+#
+# 补建集合（同时满足，且全程在单事务内裁决）：
+#   1. 事件属于该订阅的 source；
+#   2. 事件主键落在 [first_event_id, last_event_id] 闭区间；
+#   3. 事件已提交（events 行存在即已终结，未终结只在 payload_upload_pending，
+#      对本查询不可见——提交终结后由实时路径建投递或由后续补投覆盖）；
+#   4. 事件未撤销（cancelled_at IS NULL）：撤销先完成的事件绝不被补活；
+#   5. 该订阅尚无此事件的初始投递（不存在 chain_seq=1 的 deliveries 行；
+#      uq_deliveries_event_sub_initial 部分唯一索引亦在写入侧兜底）。
+# 命中的事件按主键升序逐行 nextval 分配 seq 并建立 pending（chain_seq=1、
+# chain_id 新取），故同一订阅内补投投递严格按事件主键升序排队。
+#
+# 锁顺序与先后裁决（关键不变式）：
+# 补投需要同时与 cancel_event、实时提交（finalize_event_submission）、
+# publish_version 三条路径互斥，但它们的加锁方向并不相同（撤销为“事件→
+# 订阅”，实时提交为“订阅→投递”），任何把两类锁都长期持有的固定锁序都可能
+# 与其中一方成环。补投采用“先锁订阅、后按事件主键升序锁事件”的两阶段顺序：
+#
+#   阶段一：先 FOR UPDATE 锁本订阅行（补投唯一一把订阅锁，最先取得）。
+#     - 与 publish_version 的订阅行锁互斥：在锁内读取 current_revision 并连接
+#       当前版本，补投边界固定到该版本。发布先提交则补投读到新版本（整批钉新
+#       版本），补投先提交则发布只能在其后提交（本批钉旧版本）——边界唯一；
+#     - 与 finalize_event_submission“锁该 source 全部活跃订阅”互斥：实时提交
+#       要么在补投前提交（其投递 seq 更小，补投经 NOT EXISTS 跳过，不重复建），
+#       要么在补投后提交（补投先占住初始投递，实时路径的 INSERT 不再为本订阅
+#       建行），二者对同一 (事件,订阅) 永不重复；
+#     - active=FALSE（停用身份）在锁内权威判定，直接抛 BackfillError（409）；
+#       paused=TRUE 不拦截：暂停只阻止 Worker 认领，补投照常建 pending（恢复后
+#       沿原 seq 认领）。
+#
+#   阶段二：快照筛出候选事件后，按事件主键升序逐把 FOR UPDATE 锁事件行，并在
+#   锁内重新复核 cancelled_at。升序取锁与 cancel_event 的事件行加锁方向一致，
+#   两个补投事务之间也同序，数学上不构成 AB-BA；与 cancel_event 的竞争由
+#   READ COMMITTED 的“锁等待后读最新已提交版本”裁决——
+#     * 撤销先提交：补投拿到事件行锁时复核必见 cancelled_at，该事件被排除，
+#       绝不补活（即使撤销发生在补投的快照筛选之后、事件行锁之前）；
+#     * 补投先提交：撤销只能在补投事务提交后运行，届时新 pending 行与其他
+#       pending 一样被撤销事务原子翻转为 cancelled——“补投后撤销”语义不变。
+#
+#   阶段三：INSERT ... SELECT 对仍满足全部条件的候选建 pending，并再次以内联
+#   NOT EXISTS 复核“尚无初始投递”，覆盖锁事件行期间实时提交刚好抢先的情形
+#   （部分唯一索引是最终防线）。
+#
+# 队列顺序（seq）：补投事务在实时提交之后才运行，其 nextval 必然大于补投开始
+# 前已存在的全部投递，故补投投递接在既有队列之后；补投边界之后实时提交的事件
+# 其 nextval 更大，必然排在补投投递之后。于是：先清完队列前段（含补投段，
+# 段内按事件主键升序），才会投递边界后的实时事件——顺序确定。
+#
+# 幂等：重复（含重叠）区间请求时，已建初始投递的事件被 NOT EXISTS 与唯一索引
+# 排除，created=0，不新增投递。
+#
+# 死锁兜底：补投的“订阅→事件”与 cancel/实时提交在多订阅、多事件交错的极端
+# 调度下仍可能被 Postgres 选为死锁受害者（锁等待图瞬时成环）。该操作天然幂等
+# （重试不会产生重复投递），故 API 层在 DeadlockDetectedError 时整体重试。
+
+async def backfill_subscription(
+    conn: asyncpg.Connection,
+    *,
+    subscription_id: int,
+    first_event_id: int,
+    last_event_id: int,
+) -> dict[str, Any]:
+    """为订阅补建历史事件的初始 pending 投递（单事务）。
+
+    返回 {"created": n, "config_revision": r}。订阅不存在抛 LookupError；
+    订阅 active=FALSE 抛 BackfillError("subscription_inactive")。
+    """
+    async with conn.transaction():
+        # 阶段一：锁订阅行（与版本发布、实时提交、暂停写入互斥），权威裁决
+        # active/paused 并固定当前配置版本。
+        sub = await conn.fetchrow(
+            f"""
+            SELECT {SUB_COLUMNS}
+            FROM subscriptions
+            WHERE id = $1
+            FOR UPDATE
+            """,
+            subscription_id,
+        )
+        if sub is None:
+            raise LookupError("subscription not found")
+        if not sub["active"]:
+            raise BackfillError(
+                "subscription_inactive", "订阅已停用，不允许补投（请先重新激活）"
+            )
+        version = await conn.fetchrow(
+            """
+            SELECT v.id AS version_id, v.revision AS config_revision
+            FROM subscription_versions v
+            JOIN subscriptions s ON s.id = v.subscription_id
+            WHERE s.id = $1 AND v.revision = s.current_revision
+            """,
+            subscription_id,
+        )
+        if version is None:  # 理论上不可能：订阅必有当前版本
+            raise BackfillError("no_current_version", "订阅当前配置版本不存在")
+        config_version_id = version["version_id"]
+        config_revision = version["config_revision"]
+
+        # 阶段二（快照筛选）：本订阅 source、闭区间内、未撤销、尚无初始投递的
+        # 候选事件。这是一把非加锁快照读，仅用于确定要按序锁哪些事件行。
+        candidates = await conn.fetch(
+            """
+            SELECT e.id
+            FROM events e
+            WHERE e.source = $1
+              AND e.id BETWEEN $2 AND $3
+              AND e.cancelled_at IS NULL
+              AND NOT EXISTS (
+                    SELECT 1 FROM deliveries d
+                    WHERE d.event_id_fk = e.id
+                      AND d.subscription_id = $4
+                      AND d.chain_seq = 1
+              )
+            ORDER BY e.id
+            """,
+            sub["source"],
+            first_event_id,
+            last_event_id,
+            subscription_id,
+        )
+        candidate_ids = [r["id"] for r in candidates]
+        if not candidate_ids:
+            return {"created": 0, "config_revision": config_revision}
+
+        # 阶段二（按序加锁 + 锁内复核撤销）：升序锁事件行，与 cancel_event 的
+        # 加锁方向一致；READ COMMITTED 下锁等待结束后读到最新已提交版本，
+        # 撤销先完成的事件此刻必见 cancelled_at，从补建集合剔除（绝不补活）。
+        locked_rows = await conn.fetch(
+            """
+            SELECT e.id
+            FROM unnest($1::bigint[]) WITH ORDINALITY AS k(id, ord)
+            JOIN events e ON e.id = k.id
+            WHERE e.cancelled_at IS NULL
+            ORDER BY k.ord
+            FOR UPDATE OF e
+            """,
+            candidate_ids,
+        )
+        eligible_ids = [r["id"] for r in locked_rows]
+        if not eligible_ids:
+            return {"created": 0, "config_revision": config_revision}
+
+        # 阶段三：为仍合格的事件建初始 pending。内联 NOT EXISTS 最后复核一次
+        # “尚无初始投递”（覆盖锁事件行期间实时提交抢先的情形）。
+        # seq 必须按事件主键升序分配：顶层 ORDER BY 不可被优化器省略，
+        # Postgres 在排序输出之后才逐行求值易失的 nextval，故同订阅补投段
+        # 严格按事件主键升序取得 seq（不能把 ORDER BY 放进子查询——外层无
+        # 顺序要求时该排序可能被优化器消除）。
+        result = await conn.execute(
+            """
+            INSERT INTO deliveries
+                (event_id_fk, subscription_id, config_version_id,
+                 chain_id, chain_seq, status)
+            SELECT e.id, $2, $3, nextval('delivery_chain_seq'), 1, 'pending'
+            FROM unnest($1::bigint[]) WITH ORDINALITY AS k(id, ord)
+            JOIN events e ON e.id = k.id
+            WHERE e.cancelled_at IS NULL
+              AND NOT EXISTS (
+                    SELECT 1 FROM deliveries d
+                    WHERE d.event_id_fk = e.id
+                      AND d.subscription_id = $2
+                      AND d.chain_seq = 1
+              )
+            ORDER BY k.ord
+            """,
+            eligible_ids,
+            subscription_id,
+            config_version_id,
+        )
+    created = int(result.split()[-1])
+    return {"created": created, "config_revision": config_revision}
 
 
 # -- 事件撤销 --------------------------------------------------------------------

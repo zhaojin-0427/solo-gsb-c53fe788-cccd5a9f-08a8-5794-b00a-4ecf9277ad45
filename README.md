@@ -383,6 +383,214 @@ HTTP/1.1 404 Not Found
 投递并固定提交时刻的配置版本；暂停期间发布新版本、死信重放（重放同样只
 新建 pending 链记录）也都正常工作，恢复后严格顺序语义不变。
 
+### 历史事件补投（backfill）
+
+现有事件只在**提交状态机终结的那一刻**、按当时的“活跃订阅集合”建立初始
+投递并固定配置版本。之后才注册的订阅默认收不到它创建之前的旧事件。
+`POST /api/v1/subscriptions/{id}/backfill` 用于为某个订阅**补齐这些缺失的
+初始投递**，一次性完成历史回放。
+
+请求体给**事件主键**（`events.id`，即提交/查询事件响应中的 `id`）的
+**闭区间**：
+
+```json
+{ "first_event_id": 1, "last_event_id": 100 }
+```
+
+服务端在**单事务**内，为同时满足下列条件的事件**按事件主键升序**补建
+`pending` 初始投递（`chain_seq=1`）：
+
+- 事件属于该订阅的 `source`；
+- 主键落在 `[first_event_id, last_event_id]` 闭区间内；
+- 事件**已提交**（未完成提交状态机的行尚不可见，不会被补入）；
+- 事件**未撤销**（`cancelled_at` 为空）——撤销先完成的事件绝不被补活；
+- 该订阅**尚无此事件的初始投递**。
+
+响应只返回新增数与本批次固定的配置版本：
+
+| 字段 | 含义 |
+| --- | --- |
+| `created` | 本次实际新建的 pending 投递数（已撤销/已有初始投递/区间外均不计数） |
+| `config_revision` | 本批次补建投递统一固定的配置版本（补投锁定订阅时的当前版本） |
+
+补建结果提交后立即可见：全局投递历史（`GET /deliveries`）、事件投递列表
+（`GET /events/{id}/deliveries`）与 Worker 认领队列都会包含这些投递。
+
+#### 一次完整的历史补投（docker compose 一键启动后的真实报文）
+
+先在一个终端启动全部服务（API、Worker、Postgres、MinIO、回调接收器）：
+
+```bash
+docker compose up --build
+```
+
+启动后访问地址：
+
+- API：<http://localhost:8000>（Swagger 文档 <http://localhost:8000/docs>）
+- 回调接收器：<http://localhost:8001>（已收投递 <http://localhost:8001/received>）
+
+下面的报文均为与实现一致的**实际 HTTP 请求与响应**（时间戳、自增 id 随
+实际运行变化）。注意先提交事件、**之后才创建订阅**——这正是“晚建订阅缺
+少旧事件”的场景。
+
+**1) 先提交 3 个事件（此刻还没有任何订阅，因此没有任何投递）**
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"orders","event_id":"old-1","payload":{"order":1}}'
+curl -s -X POST http://localhost:8000/api/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"orders","event_id":"old-2","payload":{"order":2}}'
+curl -s -X POST http://localhost:8000/api/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"orders","event_id":"old-3","payload":{"order":3}}'
+```
+
+**2) 之后才注册订阅**（旧事件不会自动补投递）：
+
+```bash
+curl -i -X POST http://localhost:8000/api/v1/subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"orders","target_url":"http://receiver:8001/receive","secret":"dev-signing-secret"}'
+```
+
+```http
+HTTP/1.1 201 Created
+content-type: application/json
+
+{
+    "id": 1,
+    "source": "orders",
+    "target_url": "http://receiver:8001/receive",
+    "active": true,
+    "paused": false,
+    "paused_at": null,
+    "resumed_at": null,
+    "current_revision": 1,
+    "created_at": "2026-10-07T09:00:00.000000+00:00"
+}
+```
+
+此时 `GET /api/v1/deliveries?subscription_id=1` 是空列表——订阅错过了
+`old-1/2/3`。
+
+**3) 按事件主键闭区间补投**（上面三条事件的主键恰为 1、2、3）：
+
+```bash
+curl -i -X POST http://localhost:8000/api/v1/subscriptions/1/backfill \
+  -H 'Content-Type: application/json' \
+  -d '{"first_event_id":1,"last_event_id":3}'
+```
+
+```http
+HTTP/1.1 200 OK
+content-type: application/json
+
+{
+    "subscription_id": 1,
+    "first_event_id": 1,
+    "last_event_id": 3,
+    "created": 3,
+    "config_revision": 1
+}
+```
+
+**4) 补建的 pending 立即可见于投递查询**，并由 Worker 严格按事件主键升序
+实际投递（接收器 <http://localhost:8001/received> 依次收到 `old-1`、
+`old-2`、`old-3`，各带 `X-Webhook-Config-Revision: 1`）：
+
+```bash
+curl -s 'http://localhost:8000/api/v1/deliveries?subscription_id=1' \
+  | python3 -m json.tool
+```
+
+```json
+[
+    {
+        "id": 3,
+        "event_id_fk": 3,
+        "subscription_id": 1,
+        "event_source": "orders",
+        "source_event_id": "old-3",
+        "target_url": "http://receiver:8001/receive",
+        "config_version_id": 1,
+        "config_revision": 1,
+        "config_effective_at": "2026-10-07T09:00:00.000000+00:00",
+        "chain_id": 3,
+        "chain_seq": 1,
+        "status": "succeeded",
+        "attempts_made": 1,
+        "not_before": "2026-10-07T09:01:00.000000+00:00",
+        "leased_at": null,
+        "lease_expires_at": null,
+        "leased_by": null,
+        "created_at": "2026-10-07T09:01:00.000000+00:00",
+        "updated_at": "2026-10-07T09:01:00.000000+00:00"
+    },
+    {"id": 2, "source_event_id": "old-2", "status": "succeeded", "...": "..."},
+    {"id": 1, "source_event_id": "old-1", "status": "succeeded", "...": "..."}
+]
+```
+
+（全局投递历史默认按投递 id 倒序返回；同一订阅内的**投递顺序**由 `seq`
+决定，见下。）
+
+**5) 重复区间不新增**：再次（或用任意重叠区间）补投，`created` 为 0：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/subscriptions/1/backfill \
+  -H 'Content-Type: application/json' \
+  -d '{"first_event_id":1,"last_event_id":3}'
+```
+
+```json
+{"subscription_id": 1, "first_event_id": 1, "last_event_id": 3, "created": 0, "config_revision": 1}
+```
+
+#### 顺序、版本边界与撤销如何裁决
+
+补投不是“插队”，而是把缺失投递接到队列尾部并固定一个明确的边界：
+
+- **接在既有队列之后**：补投事务运行时为新行分配的 `seq` 是单调递增的，
+  必然大于该订阅此前已存在的全部投递；补投段内部严格按**事件主键升序**
+  分配 `seq`。Worker 沿 `seq` 认领，于是先投递补投段（段内升序），
+  补投边界**之后实时提交**的事件 `seq` 更大、必然排在补投段之后；
+- **配置版本按补投边界固定**：补投事务先锁定订阅行（与版本发布、实时提交
+  互斥），在锁内读取当前 `revision`，整批补建投递都钉住该版本。发布先提交
+  则整批用新版本，补投先提交则整批用旧版本，边界唯一；
+- **撤销先完成的事件不被补活**：补投先做快照筛选，再**按事件主键升序逐一
+  锁定事件行并在锁内复核 `cancelled_at`**。若撤销在快照之后、事件行锁之前
+  提交，补投等锁后（READ COMMITTED）读到的就是已撤销状态，该事件被剔除；
+  反之补投先提交，则随后到达的撤销像对待普通 pending 一样把补建的投递翻转
+  为 `cancelled`。
+
+边界与状态码汇总：
+
+- **暂停**订阅可以补投：照常建 `pending`（钉住当前版本），但 Worker 不认领，
+  恢复后沿原 `seq` 继续；
+- **停用**订阅（`active=false`）返回 `409`（`detail.code =
+  subscription_inactive`）；
+- 未知订阅返回 `404`；
+- 非法区间（`first_event_id > last_event_id`，或主键小于 1）返回 `422`；
+- 补投不改变既有投递的严格顺序，也不影响死信重放（重放仍只在死信链上追加，
+  已撤销事件依旧拒绝重放）。
+
+```bash
+# 非法区间 -> 422
+curl -i -X POST http://localhost:8000/api/v1/subscriptions/1/backfill \
+  -H 'Content-Type: application/json' -d '{"first_event_id":10,"last_event_id":2}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":[{"type":"value_error",...,"msg":"Value error, 非法区间：
+#   first_event_id 必须小于等于 last_event_id（闭区间）",...}]}
+
+# 未知订阅 -> 404
+curl -i -X POST http://localhost:8000/api/v1/subscriptions/999999/backfill \
+  -H 'Content-Type: application/json' -d '{"first_event_id":1,"last_event_id":3}'
+# HTTP/1.1 404 Not Found
+# {"detail":"订阅不存在"}
+```
+
 ### 事件撤销
 
 `POST /api/v1/events/{event_pk}/cancel` 撤销一个事件（无需请求体）。仓储在
@@ -659,6 +867,7 @@ $ curl -s localhost:8000/api/v1/deliveries/21/attempts
 | POST | `/subscriptions/{id}/resume` | 恢复投递（幂等；沿原 seq/not_before/尝试次数继续；未知订阅 404） |
 | POST | `/subscriptions/{id}/versions` | 发布新配置版本（CAS，必须带 `expected_revision`；201/409） |
 | GET | `/subscriptions/{id}/versions` | 列出全部配置版本与切换边界（不含密钥） |
+| POST | `/subscriptions/{id}/backfill` | 历史事件补投（事件主键闭区间；为缺失初始投递的旧事件补建 pending；重复区间不新增；停用 409/未知 404/非法区间 422） |
 | GET | `/deliveries?status=&subscription_id=&source=&config_revision=` | 投递历史（含实际版本与边界） |
 | GET | `/deliveries/{id}` | 投递详情（含 `config_revision`、`config_effective_at`） |
 | GET | `/deliveries/{id}/attempts` | 每次尝试明细（状态码、响应摘要、错误、租约时间） |

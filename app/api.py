@@ -1,6 +1,7 @@
 """HTTP API：事件提交、订阅与配置版本管理、投递历史、死信与重放。"""
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
@@ -23,6 +24,8 @@ from app.objectstore import (
 )
 from app.schemas import (
     AttemptOut,
+    BackfillOut,
+    BackfillRequest,
     CancelEventOut,
     CryptoStatusOut,
     DeliveryOut,
@@ -488,6 +491,76 @@ async def list_versions(subscription_id: int) -> list[VersionOut]:
             raise HTTPException(status_code=404, detail="订阅不存在")
         rows = await repo.list_versions(conn, subscription_id)
     return [_version_out(r) for r in rows]
+
+
+# -- 历史事件补投 ------------------------------------------------------------------
+
+# 补投与撤销/实时提交在多订阅、多事件交错的极端调度下可能被 Postgres 判为
+# 死锁受害者。补投天然幂等（重复执行不产生重复投递，见仓储函数说明），
+# 整事务回滚后直接重试即可。
+_BACKFILL_DEADLOCK_RETRIES = 5
+
+
+@router.post(
+    "/subscriptions/{subscription_id}/backfill",
+    response_model=BackfillOut,
+    tags=["subscriptions"],
+)
+async def backfill_subscription(
+    subscription_id: int, body: BackfillRequest
+) -> BackfillOut:
+    """历史事件补投：为该订阅 source 下缺失初始投递的旧事件补建 pending。
+
+    请求体给事件主键（`events.id`）**闭区间** `{first_event_id, last_event_id}`，
+    服务端在单事务内为同时满足下列条件的事件按主键升序补建 pending 投递：
+    属于该订阅的 source、已提交、未撤销（`cancelled_at` 为空）、该订阅尚无
+    其初始投递。响应 `created` 即本次新增数；补建结果立即可见（投递查询、
+    事件投递列表、认领队列）。
+
+    顺序与版本边界：补投在“当前时刻”运行，新增投递的 `seq` 接在既有队列
+    之后；补投边界之后实时提交的事件 `seq` 更大，必然排在补投段之后。补投
+    段内严格按事件主键升序。整批投递固定为补投事务锁定订阅时读到的**当前
+    配置版本**（与版本发布经订阅行锁互斥，边界唯一）。
+
+    - 幂等：重复（含重叠）区间不新增投递，`created=0`（已撤销、已存在初始
+      投递的事件同样不计数）；
+    - 暂停订阅可补投（照常建 pending，但 Worker 不认领，恢复后沿原 seq 认领）；
+    - 停用订阅（`active=false`）返回 409；未知订阅返回 404；
+    - 非法区间（`first_event_id > last_event_id` 或主键 < 1）返回 422；
+    - 不影响既有投递的严格顺序、死信重放语义。
+    """
+    pool = get_pool()
+    for attempt in range(_BACKFILL_DEADLOCK_RETRIES):
+        try:
+            async with pool.acquire() as conn:
+                result = await repo.backfill_subscription(
+                    conn,
+                    subscription_id=subscription_id,
+                    first_event_id=body.first_event_id,
+                    last_event_id=body.last_event_id,
+                )
+            break
+        except LookupError:
+            raise HTTPException(status_code=404, detail="订阅不存在")
+        except repo.BackfillError as exc:
+            status_code = 409 if exc.code == "subscription_inactive" else 400
+            raise HTTPException(
+                status_code=status_code,
+                detail={"code": exc.code, "message": str(exc)},
+            )
+        except asyncpg.DeadlockDetectedError:
+            # 与撤销/实时提交的极端交错被判受害者：整事务已回滚；补投幂等，
+            # 退避后整体重试（最后一次仍失败则交由调用方重试，结果仍一致）。
+            if attempt == _BACKFILL_DEADLOCK_RETRIES - 1:
+                raise
+            await asyncio.sleep(0.05 * (attempt + 1))
+    return BackfillOut(
+        subscription_id=subscription_id,
+        first_event_id=body.first_event_id,
+        last_event_id=body.last_event_id,
+        created=result["created"],
+        config_revision=result["config_revision"],
+    )
 
 
 # -- 投递历史 / 死信 -------------------------------------------------------------
