@@ -25,3 +25,6 @@ __pycache__/
 .local-payloads/
 test-*.log
 stress-*.log
+.test-pgdata-backfill/
+.test-pgdata-backfill-db/
+.test-payloads-backfill/

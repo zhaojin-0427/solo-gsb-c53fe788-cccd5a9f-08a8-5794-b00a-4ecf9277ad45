@@ -23,6 +23,8 @@ from app.objectstore import (
 )
 from app.schemas import (
     AttemptOut,
+    BackfillOut,
+    BackfillRequest,
     CancelEventOut,
     CryptoStatusOut,
     DeliveryOut,
@@ -371,6 +373,50 @@ async def resume_subscription(subscription_id: int) -> SubscriptionOut:
     if row is None:
         raise HTTPException(status_code=404, detail="订阅不存在")
     return _subscription_out(row)
+
+@router.post(
+    "/subscriptions/{subscription_id}/backfill",
+    response_model=BackfillOut,
+    tags=["subscriptions"],
+)
+async def backfill_subscription(
+    subscription_id: int, body: BackfillRequest
+) -> BackfillOut:
+    """为订阅补投历史事件（幂等）。
+
+    为该订阅 source 下、事件主键落在 [from_event_id, to_event_id] 闭区间内、
+    已提交且未撤销、且尚无本订阅初始投递（chain_seq=1）的事件，按主键升序
+    补建 pending 投递，返回本次实际新增数（重复区间请求为 0，不新增投递）。
+
+    补投投递钉住补投边界时刻的当前配置版本，并接在该订阅既有队列之后
+    （边界后的实时投递排在其后）；暂停订阅可补投但 Worker 恢复前不认领。
+    订阅已停用返回 409，未知订阅 404，非法区间（from > to 或越界）422。
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        try:
+            result = await repo.backfill_subscription(
+                conn,
+                subscription_id=subscription_id,
+                from_event_id=body.from_event_id,
+                to_event_id=body.to_event_id,
+            )
+        except repo.BackfillError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code, "message": str(exc)},
+            )
+    if result is None:
+        raise HTTPException(status_code=404, detail="订阅不存在")
+    return BackfillOut(
+        subscription_id=subscription_id,
+        source=result["source"],
+        from_event_id=body.from_event_id,
+        to_event_id=body.to_event_id,
+        created=result["created"],
+        config_version_id=result["config_version_id"],
+        config_revision=result["config_revision"],
+    )
 
 
 # -- 订阅配置版本 / 无损切换 -----------------------------------------------------

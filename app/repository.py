@@ -28,6 +28,14 @@ class ConfigConflictError(Exception):
         self.current_revision = current_revision
 
 
+class BackfillError(Exception):
+    """历史事件补投被领域规则拒绝（如订阅已停用）。"""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 # -- 行 -> dict 映射 -----------------------------------------------------------
 
 DELIVERY_COLUMNS = """
@@ -923,6 +931,150 @@ async def sweep_expired_cancelled_in_flight_round(
         if n < _SWEEP_EXPIRED_LIMIT:
             break
     return total
+
+
+# -- 订阅历史事件补投（backfill） --------------------------------------------------
+#
+# 事件只在提交状态机终结时对当时的活跃订阅建初始投递（chain_seq=1），晚注册/
+# 晚激活的订阅因此缺少此前已提交的事件。backfill_subscription 为指定订阅补建
+# 这些缺失的初始投递（pending），单事务完成。语义要点：
+#
+# 锁序（与全局“事件行 → 订阅行 → 投递行”同向，数学上不构成等待环）：
+#   1. 过滤并锁定候选事件行（SELECT ... FOR UPDATE，按主键升序）：该订阅
+#      source 下已提交、未撤销（cancelled_at IS NULL）且尚无本订阅初始投递
+#      （chain_seq=1）的事件。事件行锁与 cancel_event 的事件行锁互斥——
+#      * 撤销先提交：本事务在事件行锁等待后按 READ COMMITTED 重评估 WHERE，
+#        事件已带 cancelled_at 即被跳过——撤销先完成的事件绝不补活；
+#      * 本事务先持锁：撤销只能随后获得事件行锁，提交时把本次新建的 pending
+#        一并翻转为终态 cancelled（与“重放先提交则被随后撤销翻转”的既有
+#        语义一致），同样不存在被补活的在途投递。
+#      注意不能反过来“先锁订阅再过滤事件”：对尚无投递的事件，撤销事务不会
+#      持有该订阅行锁（其订阅锁集合来自该事件已有投递），先锁订阅无法与撤销
+#      串行；且“订阅行 → 事件行”与撤销的“事件行 → 订阅行”会构成 AB-BA。
+#   2. 锁定订阅行（FOR UPDATE）：与实时提交（finalize_event_submission 锁
+#      同 source 活跃订阅）、版本发布（publish_version）、暂停/恢复
+#      （set_subscription_paused）严格串行。在锁内权威检查 active（停用拒绝）
+#      并读取 current_revision——该锁即补投边界：边界前的实时投递在队列中
+#      位于补投投递之前；边界后的实时提交与版本发布都在补投提交之后生效。
+#   3. 插入初始投递：chain_id 取新序列值、chain_seq=1、status='pending'，
+#      config_version_id 钉住边界时刻的当前版本；seq 由全局序列在插入时
+#      分配——插入发生在持有订阅行锁期间，与实时提交的插入严格串行，因此
+#      补投投递接在既有队列之后，边界后的实时投递排在其后，严格顺序与
+#      死信重放语义不变（补投投递就是普通的链首 pending）。
+#
+# 幂等：部分唯一索引 uq_deliveries_event_sub_initial（(event_id_fk,
+# subscription_id) WHERE chain_seq = 1）保证每个事件在同一订阅下至多一条
+# 初始投递；ON CONFLICT DO NOTHING 兜底并发同订阅补投的陈旧快照（其
+# NOT EXISTS 在对方提交前评估），重复区间请求不新增投递（created=0）。
+#
+# 暂停（paused=TRUE）订阅允许补投：只建 pending，Worker 在恢复前不认领；
+# 停用（active=FALSE）订阅拒绝补投（BackfillError -> HTTP 409）。
+
+async def backfill_subscription(
+    conn: asyncpg.Connection,
+    *,
+    subscription_id: int,
+    from_event_id: int,
+    to_event_id: int,
+) -> dict[str, Any] | None:
+    """为订阅补建 [from_event_id, to_event_id] 闭区间内缺失的初始投递。
+
+    单事务；按事件主键升序补建 pending 投递并钉住边界时刻的当前配置版本。
+    返回结果 dict（created 为本次实际新增数，重复区间为 0）；订阅不存在
+    返回 None；订阅已停用抛 BackfillError("subscription_inactive")。
+    """
+    async with conn.transaction():
+        # 无锁读订阅身份：404 判定与取 source（source 是订阅身份，不可变）；
+        # active 的权威检查在取得订阅行锁之后进行。
+        sub = await conn.fetchrow(
+            "SELECT id, source FROM subscriptions WHERE id = $1",
+            subscription_id,
+        )
+        if sub is None:
+            return None
+        source = sub["source"]
+
+        # 第 1 步：过滤并锁定候选事件（锁序：事件行 → 订阅行）。FOR UPDATE
+        # 与并发撤销互斥：撤销先提交则行在锁等待后被重评估而跳过；本事务先
+        # 持锁则撤销随后把新建 pending 翻转为 cancelled。
+        events = await conn.fetch(
+            """
+            SELECT e.id
+            FROM events e
+            WHERE e.source = $1
+              AND e.id BETWEEN $2::bigint AND $3::bigint
+              AND e.cancelled_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM deliveries d
+                  WHERE d.event_id_fk = e.id
+                    AND d.subscription_id = $4
+                    AND d.chain_seq = 1
+              )
+            ORDER BY e.id
+            FOR UPDATE OF e
+            """,
+            source,
+            from_event_id,
+            to_event_id,
+            subscription_id,
+        )
+
+        # 第 2 步：锁订阅行（补投边界），权威检查 active 并读取当前版本。
+        locked = await conn.fetchrow(
+            """
+            SELECT id, active, current_revision
+            FROM subscriptions
+            WHERE id = $1
+            FOR UPDATE
+            """,
+            subscription_id,
+        )
+        if not locked["active"]:
+            raise BackfillError(
+                "subscription_inactive", "订阅已停用，不允许补投历史事件"
+            )
+        version = await conn.fetchrow(
+            """
+            SELECT id, revision
+            FROM subscription_versions
+            WHERE subscription_id = $1 AND revision = $2
+            """,
+            subscription_id,
+            locked["current_revision"],
+        )
+
+        # 第 3 步：按主键升序补建链首 pending 投递（钉住边界版本）。
+        # ON CONFLICT 对应部分唯一索引 uq_deliveries_event_sub_initial：
+        # 并发同订阅补投的重复行静默跳过，不计入 created。
+        created = 0
+        if events:
+            rows = await conn.fetch(
+                """
+                INSERT INTO deliveries
+                    (event_id_fk, subscription_id, config_version_id,
+                     chain_id, chain_seq, status)
+                SELECT e.id, $2, $3,
+                       nextval('delivery_chain_seq'), 1, 'pending'
+                FROM events e
+                WHERE e.id = ANY($1::bigint[])
+                ORDER BY e.id
+                ON CONFLICT (event_id_fk, subscription_id)
+                    WHERE chain_seq = 1
+                DO NOTHING
+                RETURNING id
+                """,
+                [r["id"] for r in events],
+                subscription_id,
+                version["id"],
+            )
+            created = len(rows)
+        return {
+            "subscription_id": subscription_id,
+            "source": source,
+            "created": created,
+            "config_version_id": version["id"],
+            "config_revision": version["revision"],
+        }
 
 
 # -- Worker：认领队首任务 --------------------------------------------------------

@@ -49,6 +49,14 @@
   事件 404；撤销后以同一 `source/event_id` 重复提交只返回原事件（带
   `cancelled_at`），**不复活任何投递**。事件查询返回撤销时刻，投递查询
   展示 `cancelled` 终态。详见下文[“事件撤销”](#事件撤销)。
+- **订阅历史事件补投（backfill）**：`POST /api/v1/subscriptions/{id}/backfill`
+  接收事件主键闭区间，为该订阅 source 下**已提交、未撤销且尚无初始投递**
+  的事件按主键升序补建 `pending` 投递并返回新增数，投递查询立即可见。
+  补投与实时提交、版本发布经订阅行锁确定先后：补投投递接在既有队列之后、
+  钉住补投边界时刻的配置版本，边界后的实时投递排在其后；筛选事件时即
+  锁定事件行（与撤销同向），撤销先完成的事件不被补活。重复区间请求不
+  新增投递（幂等）；暂停可补投但不认领，停用返回 409、未知订阅 404、
+  非法区间 422。详见下文[“订阅历史事件补投”](#订阅历史事件补投backfill)。
 - **HMAC 签名**：每次投递携带时间戳签名头
   `X-Webhook-Signature: t=<unix秒>,v1=<HMAC-SHA256 hex>`，签名内容为
   `<timestamp>.<紧凑排序 JSON 载荷>`；密钥取自该投递钉住的配置版本。
@@ -642,6 +650,349 @@ $ curl -s localhost:8000/api/v1/deliveries/21/attempts
 - **租约过期接管**本质是一条新的认领事务，同样被撤销复核拦截——过期
   `in_flight` 不会被重新投递，而是直接转 `cancelled`（不新增尝试记录）。
 
+### 订阅历史事件补投（backfill）
+
+事件只在提交状态机终结时对当时的**活跃订阅**建立初始投递
+（`chain_seq=1`）；晚注册（或晚激活）的订阅因此缺少此前已提交的历史
+事件。补投接口为这些事件补建缺失的初始投递：
+
+```http
+POST /api/v1/subscriptions/{id}/backfill
+Content-Type: application/json
+
+{"from_event_id": <事件主键下界>, "to_event_id": <事件主键上界>}
+```
+
+区间为**闭区间**（两端都包含）。仓储在**单事务**内为该订阅 source 下、
+主键落在区间内、**已提交、未撤销且尚无本订阅初始投递**的事件，按主键
+升序各补建一条 `pending` 投递（新链，`chain_seq=1`），返回本次实际
+新增数 `created`；补建结果在投递查询中立即可见。行为约定：
+
+- **幂等**：每个事件在同一订阅下至多一条初始投递（数据库部分唯一索引
+  `uq_deliveries_event_sub_initial` 保证），重复/重叠区间请求不新增
+  投递（`created=0`）；
+- **补投边界（与实时提交、版本发布的先后）**：补投在持有**订阅行锁**
+  的事务内读取 `current_revision` 并插入投递，与实时提交（锁同 source
+  活跃订阅）、版本发布（锁同一订阅行）严格串行——补投投递接在该订阅
+  **既有队列之后**（`seq` 更大），并**钉住边界时刻的当前配置版本**；
+  边界后的实时提交与版本发布在补投提交之后生效（实时投递排在补投
+  投递之后）；
+- **撤销先完成的事件不被补活（筛选事件与锁订阅的先后）**：先在**事件
+  行锁**下筛选候选（锁序“事件行 → 订阅行”，与撤销事务同向，不构成
+  等待环），再锁订阅行——撤销先提交的事件在锁等待后被重评估而跳过
+  （不产生任何投递）；补投先提交时，随后的撤销把补建的 `pending` 翻转
+  为终态 `cancelled`（与“重放先提交则被随后撤销翻转”的语义一致）。
+  两种先后都不会留下被“补活”的在途投递；
+- **暂停可补投但不认领**：暂停（`paused=true`）订阅照常补建 `pending`
+  并钉住当时配置版本，Worker 在恢复前不认领它们；**停用
+  （`active=false`）订阅拒绝补投（409）**；
+- 未知订阅 **404**；非法区间（`from_event_id > to_event_id`、主键越界
+  值、缺字段）**422**；严格顺序、退避、死信与死信重放语义不变——补投
+  投递就是普通的链首 `pending`，其重试/接管/死信/重放与实时投递相同。
+
+#### 一次完整的历史补投（实际 HTTP 报文）
+
+用 Docker Compose 一键启动（db/minio/api/worker/receiver 全部就绪）：
+
+```bash
+docker compose up --build
+```
+
+访问地址：API <http://localhost:8000>（交互文档
+<http://localhost:8000/docs>），本地回调接收器 <http://localhost:8001>
+（接收记录 <http://localhost:8001/received>）。以下请求/响应为与实现
+一致的**实际 HTTP 报文**（`curl -i` 原样输出；时间戳随实际运行变化）。
+
+**1) 订阅创建前提交三个历史事件**（此时没有任何订阅，不产生投递）：
+
+```bash
+curl -i -X POST http://localhost:8000/api/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"orders","event_id":"evt-1001","payload":{"order":1}}'
+# 同样方式再提交 evt-1002（id=2）、evt-1003（id=3）
+```
+
+```http
+HTTP/1.1 201 Created
+content-type: application/json
+
+{"id":1,"source":"orders","event_id":"evt-1001","payload":{"order":1},"payload_digest":"a781679e01308cfef90983a4c1350319a7e3993c3a3f5a8c8439781a326d7c8d","created_at":"2026-10-07T04:42:28.362209Z","cancelled_at":null,"duplicate":false}
+```
+
+此时 `orders` 下没有任何投递：
+
+```bash
+curl -i 'http://localhost:8000/api/v1/deliveries?source=orders'
+```
+
+```http
+HTTP/1.1 200 OK
+content-type: application/json
+
+[]
+```
+
+**2) 注册订阅**（生成 revision=1；compose 内接收器主机名为 `receiver`）：
+
+```bash
+curl -i -X POST http://localhost:8000/api/v1/subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"orders","target_url":"http://receiver:8001/receive","secret":"dev-signing-secret"}'
+```
+
+```http
+HTTP/1.1 201 Created
+content-type: application/json
+
+{"id":1,"source":"orders","target_url":"http://receiver:8001/receive","active":true,"paused":false,"paused_at":null,"resumed_at":null,"current_revision":1,"created_at":"2026-10-07T04:43:38.236859Z"}
+```
+
+**3) 订阅后的实时事件立即入队**：再提交 `evt-1004`（id=4），它按既有
+逻辑建立投递并被 Worker 送达——这条实时投递构成补投前的既有队尾。
+
+**4) 历史补投**：为订阅 1 补建事件主键闭区间 `[1,3]` 内缺失的投递：
+
+```bash
+curl -i -X POST http://localhost:8000/api/v1/subscriptions/1/backfill \
+  -H 'Content-Type: application/json' \
+  -d '{"from_event_id":1,"to_event_id":3}'
+```
+
+```http
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"subscription_id":1,"source":"orders","from_event_id":1,"to_event_id":3,"created":3,"config_version_id":1,"config_revision":1}
+```
+
+`created=3`：evt-1001/1002/1003 各补建一条 `pending` 投递，钉住补投
+边界时刻的配置版本（`config_revision=1`）。**重复同一区间幂等**：
+
+```bash
+curl -i -X POST http://localhost:8000/api/v1/subscriptions/1/backfill \
+  -H 'Content-Type: application/json' \
+  -d '{"from_event_id":1,"to_event_id":3}'
+```
+
+```http
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"subscription_id":1,"source":"orders","from_event_id":1,"to_event_id":3,"created":0,"config_version_id":1,"config_revision":1}
+```
+
+**5) 投递查询可见**：补建的 3 条（id=2,3,4）与实时投递（id=1，
+evt-1004）都在历史中；补投投递是链首（`chain_seq=1`）、钉住 rev1，
+并已被 Worker 按序送达：
+
+```bash
+curl -s 'http://localhost:8000/api/v1/deliveries?source=orders' | python3 -m json.tool
+```
+
+```json
+[
+    {
+        "id": 4,
+        "event_id_fk": 3,
+        "subscription_id": 1,
+        "event_source": "orders",
+        "source_event_id": "evt-1003",
+        "target_url": "http://receiver:8001/receive",
+        "config_version_id": 1,
+        "config_revision": 1,
+        "config_effective_at": "2026-10-07T04:43:38.236859Z",
+        "chain_id": 4,
+        "chain_seq": 1,
+        "status": "succeeded",
+        "attempts_made": 1,
+        "not_before": "2026-10-07T04:46:38.417804Z",
+        "leased_at": null,
+        "lease_expires_at": null,
+        "leased_by": null,
+        "created_at": "2026-10-07T04:46:38.281566Z",
+        "updated_at": "2026-10-07T04:46:38.417804Z"
+    },
+    {
+        "id": 3,
+        "event_id_fk": 2,
+        "subscription_id": 1,
+        "event_source": "orders",
+        "source_event_id": "evt-1002",
+        "target_url": "http://receiver:8001/receive",
+        "config_version_id": 1,
+        "config_revision": 1,
+        "config_effective_at": "2026-10-07T04:43:38.236859Z",
+        "chain_id": 3,
+        "chain_seq": 1,
+        "status": "succeeded",
+        "attempts_made": 1,
+        "not_before": "2026-10-07T04:46:38.403869Z",
+        "leased_at": null,
+        "lease_expires_at": null,
+        "leased_by": null,
+        "created_at": "2026-10-07T04:46:38.281566Z",
+        "updated_at": "2026-10-07T04:46:38.403869Z"
+    },
+    {
+        "id": 2,
+        "event_id_fk": 1,
+        "subscription_id": 1,
+        "event_source": "orders",
+        "source_event_id": "evt-1001",
+        "target_url": "http://receiver:8001/receive",
+        "config_version_id": 1,
+        "config_revision": 1,
+        "config_effective_at": "2026-10-07T04:43:38.236859Z",
+        "chain_id": 2,
+        "chain_seq": 1,
+        "status": "succeeded",
+        "attempts_made": 1,
+        "not_before": "2026-10-07T04:46:38.390000Z",
+        "leased_at": null,
+        "lease_expires_at": null,
+        "leased_by": null,
+        "created_at": "2026-10-07T04:46:38.281566Z",
+        "updated_at": "2026-10-07T04:46:38.390000Z"
+    },
+    {
+        "id": 1,
+        "event_id_fk": 4,
+        "subscription_id": 1,
+        "event_source": "orders",
+        "source_event_id": "evt-1004",
+        "target_url": "http://receiver:8001/receive",
+        "config_version_id": 1,
+        "config_revision": 1,
+        "config_effective_at": "2026-10-07T04:43:38.236859Z",
+        "chain_id": 1,
+        "chain_seq": 1,
+        "status": "succeeded",
+        "attempts_made": 1,
+        "not_before": "2026-10-07T04:44:22.008081Z",
+        "leased_at": null,
+        "lease_expires_at": null,
+        "leased_by": null,
+        "created_at": "2026-10-07T04:44:21.946962Z",
+        "updated_at": "2026-10-07T04:44:22.008081Z"
+    }
+]
+```
+
+**6) 顺序验证**：补投投递接在既有队列之后——实时事件 `evt-1004` 先于
+补投事件入队，接收器实际接收顺序为实时投递在前、补投按事件主键升序
+随后：
+
+```bash
+curl -s 'http://localhost:8001/received?limit=10' \
+  | python3 -c "import json,sys; print([x['event_id'] for x in json.load(sys.stdin)['items']])"
+['evt-1004', 'evt-1001', 'evt-1002', 'evt-1003']
+```
+
+**7) 错误语义**：未知订阅 404、非法区间 422、停用订阅 409：
+
+```bash
+curl -i -X POST http://localhost:8000/api/v1/subscriptions/999999/backfill \
+  -H 'Content-Type: application/json' -d '{"from_event_id":1,"to_event_id":3}'
+```
+
+```http
+HTTP/1.1 404 Not Found
+content-type: application/json
+
+{"detail":"订阅不存在"}
+```
+
+```bash
+curl -i -X POST http://localhost:8000/api/v1/subscriptions/1/backfill \
+  -H 'Content-Type: application/json' -d '{"from_event_id":3,"to_event_id":1}'
+```
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+content-type: application/json
+
+{"detail":[{"type":"value_error","loc":["body"],"msg":"Value error, 非法区间：from_event_id 不能大于 to_event_id（闭区间）","input":{"from_event_id":3,"to_event_id":1},"ctx":{"error":{}}}]}
+```
+
+```bash
+# 停用订阅（演示用；重新注册同 source+URL 即重新激活）
+docker compose exec db psql -U webhook -d webhooks \
+  -c "UPDATE subscriptions SET active = FALSE WHERE id = 1"
+curl -i -X POST http://localhost:8000/api/v1/subscriptions/1/backfill \
+  -H 'Content-Type: application/json' -d '{"from_event_id":1,"to_event_id":3}'
+```
+
+```http
+HTTP/1.1 409 Conflict
+content-type: application/json
+
+{"detail":{"code":"subscription_inactive","message":"订阅已停用，不允许补投历史事件"}}
+```
+
+**8) 暂停可补投但不认领**：暂停中的订阅照常补建 `pending`（钉住当时
+配置版本），Worker 恢复前不认领；恢复后沿原 `seq` 继续：
+
+```bash
+# 另一个 source：先提交事件 ret-1（id=5，无订阅、无投递），创建订阅 2 并暂停
+curl -s -X POST http://localhost:8000/api/v1/events \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"returns","event_id":"ret-1","payload":{"rma":7}}'
+curl -s -X POST http://localhost:8000/api/v1/subscriptions \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"returns","target_url":"http://receiver:8001/receive","secret":"dev-signing-secret"}'
+curl -s -X POST http://localhost:8000/api/v1/subscriptions/2/pause
+
+# 暂停中补投：200，created=1
+curl -i -X POST http://localhost:8000/api/v1/subscriptions/2/backfill \
+  -H 'Content-Type: application/json' -d '{"from_event_id":5,"to_event_id":5}'
+```
+
+```http
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"subscription_id":2,"source":"returns","from_event_id":5,"to_event_id":5,"created":1,"config_version_id":2,"config_revision":1}
+```
+
+```bash
+# 暂停中投递保持 pending、零尝试（Worker 不认领）
+curl -s 'http://localhost:8000/api/v1/deliveries?source=returns' | python3 -m json.tool
+```
+
+```json
+[
+    {
+        "id": 5,
+        "event_id_fk": 5,
+        "subscription_id": 2,
+        "event_source": "returns",
+        "source_event_id": "ret-1",
+        "target_url": "http://receiver:8001/receive",
+        "config_version_id": 2,
+        "config_revision": 1,
+        "config_effective_at": "2026-10-07T04:52:28.254472Z",
+        "chain_id": 5,
+        "chain_seq": 1,
+        "status": "pending",
+        "attempts_made": 0,
+        "not_before": "2026-10-07T04:52:28.302649Z",
+        "leased_at": null,
+        "lease_expires_at": null,
+        "leased_by": null,
+        "created_at": "2026-10-07T04:52:28.302649Z",
+        "updated_at": "2026-10-07T04:52:28.302649Z"
+    }
+]
+```
+
+```bash
+# 恢复后补投投递被认领送达（严格顺序与退避语义不变）
+curl -s -X POST http://localhost:8000/api/v1/subscriptions/2/resume
+curl -s 'http://localhost:8000/api/v1/deliveries?source=returns' \
+  | python3 -c "import json,sys; print([(x['source_event_id'], x['status']) for x in json.load(sys.stdin)])"
+[('ret-1', 'succeeded')]
+```
+
 ## API 一览
 
 所有业务 API 前缀为 `/api/v1`，交互文档见 `/docs`。
@@ -657,6 +1008,7 @@ $ curl -s localhost:8000/api/v1/deliveries/21/attempts
 | GET | `/subscriptions/{id}` | 查询订阅（含 `current_revision` 与暂停状态，不含密钥） |
 | POST | `/subscriptions/{id}/pause` | 暂停投递（幂等；成功后不再产生新租约，暂停前已认领的尝试照常结算） |
 | POST | `/subscriptions/{id}/resume` | 恢复投递（幂等；沿原 seq/not_before/尝试次数继续；未知订阅 404） |
+| POST | `/subscriptions/{id}/backfill` | 历史事件补投（幂等；按事件主键闭区间补建缺失的初始投递；暂停可补投，停用 409、未知 404、非法区间 422） |
 | POST | `/subscriptions/{id}/versions` | 发布新配置版本（CAS，必须带 `expected_revision`；201/409） |
 | GET | `/subscriptions/{id}/versions` | 列出全部配置版本与切换边界（不含密钥） |
 | GET | `/deliveries?status=&subscription_id=&source=&config_revision=` | 投递历史（含实际版本与边界） |

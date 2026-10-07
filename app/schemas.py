@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class EventCreate(BaseModel):
@@ -152,6 +152,34 @@ class ReplayOut(BaseModel):
     chain_seq: int
     status: str
     # 新投递固化的配置版本（默认与原投递相同）
+    config_revision: int
+
+
+class BackfillRequest(BaseModel):
+    """历史事件补投区间：事件主键闭区间（两端都包含）。"""
+
+    from_event_id: int = Field(ge=1, le=9223372036854775807, examples=[1])
+    to_event_id: int = Field(ge=1, le=9223372036854775807, examples=[100])
+
+    @model_validator(mode="after")
+    def _check_closed_interval(self) -> "BackfillRequest":
+        if self.from_event_id > self.to_event_id:
+            raise ValueError(
+                "非法区间：from_event_id 不能大于 to_event_id（闭区间）"
+            )
+        return self
+
+
+class BackfillOut(BaseModel):
+    """补投结果：created 为本次实际新建的 pending 投递数（重复区间为 0）。"""
+
+    subscription_id: int
+    source: str
+    from_event_id: int
+    to_event_id: int
+    created: int
+    # 补投投递钉住的配置版本（补投边界时刻的当前版本）
+    config_version_id: int
     config_revision: int
 
 

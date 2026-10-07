@@ -86,7 +86,8 @@ app = FastAPI(
     version="1.0.0",
     description=(
         "事件幂等提交、内容寻址载荷对象存储、严格顺序投递、租约抢占、"
-        "指数退避、死信重放、事件撤销（cancel）。交互文档见 /docs。"
+        "指数退避、死信重放、事件撤销（cancel）、订阅历史事件补投"
+        "（backfill）。交互文档见 /docs。"
     ),
     lifespan=lifespan,
 )
